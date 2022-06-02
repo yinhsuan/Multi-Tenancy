@@ -21,6 +21,7 @@ class MultiTenancy(app_manager.RyuApp):
         vlans = VlansConfig().vlans
         self.vlan_hosts = vlans['hosts']
         self.datapath_trunks = vlans['trunks']
+        self.dp_port_vlan = vlans['dp_port_vlan']
 
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -94,9 +95,9 @@ class MultiTenancy(app_manager.RyuApp):
                 self.logger.info("")
                 return
 
+
         if (datapath.id in self.datapath_trunks and in_port in self.datapath_trunks[datapath.id]):
-            if not pkt.get_protocols(vlan.vlan):
-                # icmp => broadcast
+            if not pkt.get_protocols(vlan.vlan) and dst != "ff:ff:ff:ff:ff:ff":
                 out_port = ofproto.OFPP_FLOOD
                 actions = [parser.OFPActionOutput(in_port)]
                 self.packet_out(datapath, msg.buffer_id, in_port, actions, msg.data)
@@ -104,9 +105,8 @@ class MultiTenancy(app_manager.RyuApp):
                 self.logger.info("")
                 return
 
-        if (dst not in self.vlan_hosts):
-            if not pkt.get_protocols(vlan.vlan):
-                # icmp => broadcast
+        if dst not in self.vlan_hosts:
+            if not pkt.get_protocols(vlan.vlan) and dst != "ff:ff:ff:ff:ff:ff":
                 out_port = ofproto.OFPP_FLOOD
                 actions = [parser.OFPActionOutput(out_port)]
                 self.packet_out(datapath, msg.buffer_id, in_port, actions, msg.data)
@@ -121,15 +121,49 @@ class MultiTenancy(app_manager.RyuApp):
         else:
             out_port = ofproto.OFPP_FLOOD
 
-        # -------------------- LOGIC -------------------- #
-        if self.vlan_hosts[src] is not self.vlan_hosts[dst]:
+
+        # -------------------- STEP 2: FLOOD or BROADCAST -------------------- #
+        if out_port is ofproto.OFPP_FLOOD or dst is "ff:ff:ff:ff:ff:ff":
+            # edge switch
+            if datapath.id in self.datapath_trunks:
+                trunk_port = self.datapath_trunks[datapath.id]
+                # pop vlan
+                if in_port in trunk_port:
+                    self.logger.info("6. Flood, remove tag")
+                    self.logger.info("")
+
+                    # find output port in the same vlan
+                    if self.vlan_hosts[src] in self.dp_port_vlan[datapath.id]:
+                        out_port = self.dp_port_vlan[datapath.id].index(self.vlan_hosts[src])
+                        actions = [parser.OFPActionPopVlan(),
+                                parser.OFPActionOutput(out_port)]
+                    else:
+                        # drop
+                        actions = []
+
+                # push vlan
+                else:
+                    vlan_id = self.vlan_hosts[src]
+                    self.logger.info("4. Flood, add vlan tag")
+                    self.logger.info("")
+                    actions = [parser.OFPActionPushVlan(ether_types.ETH_TYPE_8021Q),
+                            parser.OFPActionSetField(vlan_vid=(0x1000 | vlan_id)),
+                            parser.OFPActionOutput(trunk_port[0])]
+            # normal switch
+            else:
+                self.logger.info("5. Just Flood")
+                self.logger.info("")
+                actions = [parser.OFPActionOutput(out_port)]
+
+        # -------------------- STEP 3: CHECK in the SAME VLAN -------------------- #
+        elif self.vlan_hosts[src] is not self.vlan_hosts[dst]:
             # out_port = []
             actions = []
             self.logger.info("0. not in the same VLAN")
             self.logger.info("")
 
-        elif out_port != ofproto.OFPP_FLOOD:
-            # -------------------- STEP 2: check if vlan tag is present & check if edge switch -------------------- #
+        # -------------------- STEP 4: check if vlan tag is present & check if edge switch -------------------- #
+        else:
             # edge switch
             if datapath.id in self.datapath_trunks:
                 # remove the vlan tag & forward
@@ -182,34 +216,7 @@ class MultiTenancy(app_manager.RyuApp):
                 else:
                     self.add_flow(datapath, 1, match, actions)
 
-        # -------------------- FLOOD -------------------- #
-        else:
-            # edge switch
-            if datapath.id in self.datapath_trunks:
-                trunk_port = self.datapath_trunks[datapath.id]
-                # pop vlan
-                if in_port in trunk_port:
-                    self.logger.info("6. Flood, remove tag")
-                    self.logger.info("")
-                    vlan_id = self.vlan_hosts[dst]
-                    match = parser.OFPMatch(vlan_vid=(0x1000 | vlan_id), eth_dst=dst)
-                    actions = [parser.OFPActionPopVlan(),
-                            parser.OFPActionOutput(out_port)]
-                # push vlan
-                else:
-                    vlan_id = self.vlan_hosts[src]
-                    # self.logger.info("vlan_id: %s", vlan_id)
-                    match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-                    self.logger.info("4. Flood, add vlan tag")
-                    self.logger.info("")
-                    actions = [parser.OFPActionPushVlan(ether_types.ETH_TYPE_8021Q),
-                            parser.OFPActionSetField(vlan_vid=(0x1000 | vlan_id)),
-                            parser.OFPActionOutput(out_port)]
-            # normal switch
-            else:
-                self.logger.info("5. Just Flood")
-                self.logger.info("")
-                actions = [parser.OFPActionOutput(out_port)]
+            
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
